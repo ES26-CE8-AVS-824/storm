@@ -25,21 +25,32 @@ EPS_LOG = 1e-10
 base_parser = ArgumentParser(add_help=False)
 parser = ArgumentParser()
 for parser_ in (base_parser, parser):
-	parser_.add_argument("--test_dir", type=str, required=True, help="Directory containing your corrupted files to enhance.")
-	parser_.add_argument("--enhanced_dir", type=str, required=True, help="Where to write your cleaned files.")
-	parser_.add_argument("--ckpt", type=str, required=True)
-	parser_.add_argument("--mode", required=True, choices=["score-only", "denoiser-only", "storm"])
+    parser_.add_argument("--test_dir", type=str, required=True,
+                         help="Directory containing your corrupted files to enhance.")
+    parser_.add_argument("--enhanced_dir", type=str, required=True, help="Where to write your cleaned files.")
+    parser_.add_argument("--ckpt", type=str, required=True, help="Path to the checkpoint of your trained model.")
+    parser_.add_argument("--mode", choices=["score-only", "denoiser-only", "storm"], default="storm",
+                         help="Whether to use the full model (storm = score + denoiser) or only one of the two components.")
 
-	parser_.add_argument("--corrector", type=str, choices=("ald", "langevin", "none"), default="ald", help="Corrector class for the PC sampler.")
-	parser_.add_argument("--corrector-steps", type=int, default=1, help="Number of corrector steps")
-	parser_.add_argument("--snr", type=float, default=0.5, help="SNR value for (annealed) Langevin dynamics.")
-	parser_.add_argument("--N", type=int, default=50, help="Number of reverse steps")
+    parser_.add_argument("--corrector", type=str, choices=("ald", "langevin", "none"), default="ald",
+                         help="Corrector class for the PC sampler.")
+    parser_.add_argument("--corrector-steps", type=int, default=1, help="Number of corrector steps")
+    parser_.add_argument("--snr", type=float, default=0.5, help="SNR value for (annealed) Langevin dynamics.")
+    parser_.add_argument("--N", type=int, default=50, help="Number of reverse steps")
+
+    parser_.add_argument("--device", type=str, default="cuda", help="Device to use for inference")
+    parser_.add_argument("--trusted_ckpt", action="store_true",
+                         help="Whether to trust the checkpoint path provided (for loading from private checkpoints)")
 
 args = parser.parse_args()
 
+if args.device != "cuda" or not torch.cuda.is_available():
+    print("Unfortunately, StoRM only supports GPU inference at the moment. Skipping enhancement via StoRM.")
+    exit(0)
+
 os.makedirs(args.enhanced_dir, exist_ok=True)
 
-#Checkpoint
+# Checkpoint
 checkpoint_file = args.ckpt
 
 # Settings
@@ -47,15 +58,16 @@ model_sr = 16000
 
 # Load score model 
 if args.mode == "storm":
-	model_cls = StochasticRegenerationModel
+    model_cls = StochasticRegenerationModel
 elif args.mode == "score-only":
-	model_cls = ScoreModel
+    model_cls = ScoreModel
 elif args.mode == "denoiser-only":
-	model_cls = DiscriminativeModel
+    model_cls = DiscriminativeModel
 
 model = model_cls.load_from_checkpoint(
-	checkpoint_file, base_dir="",
-	batch_size=1, num_workers=0, kwargs=dict(gpu=False)
+    checkpoint_file, base_dir="",
+    batch_size=1, num_workers=0, kwargs=dict(gpu=False),
+    weights_only=not args.trusted_ckpt
 )
 model.eval(no_ema=False)
 model.cuda()
@@ -64,9 +76,8 @@ noisy_files = sorted(glob.glob(os.path.join(args.test_dir, "*.wav")))
 
 # Loop on files
 for f in tqdm.tqdm(noisy_files):
+    y, sample_sr = torchaudio.load(f)
+    assert sample_sr == model_sr, "You need to make sure sample_sr matches model_sr --> resample to 16kHz"
+    x_hat = model.enhance(y, corrector=args.corrector, N=args.N, corrector_steps=args.corrector_steps, snr=args.snr)
 
-	y, sample_sr = torchaudio.load(f)
-	assert sample_sr == model_sr, "You need to make sure sample_sr matches model_sr --> resample to 16kHz"
-	x_hat = model.enhance(y, corrector=args.corrector, N=args.N, corrector_steps=args.corrector_steps, snr=args.snr)
-
-	save(f'{args.enhanced_dir}/{os.path.basename(f)}', x_hat.type(torch.float32).cpu().squeeze().unsqueeze(0), model_sr)
+    save(f'{args.enhanced_dir}/{os.path.basename(f)}', x_hat.type(torch.float32).cpu().squeeze().unsqueeze(0), model_sr)
